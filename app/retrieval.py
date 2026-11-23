@@ -124,7 +124,7 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
+def search_hits(query: str) -> list[dict]:
     """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
@@ -136,6 +136,37 @@ def search(query: str) -> list[dict]:
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
         return [dict(row) for row in rows]
+
+
+def _include_adjacent_pages(hits: list[dict], pages: list[dict]) -> list[dict]:
+    """検索ヒットの前後1ページを、同じ資料・章の範囲内で重複なく加える。"""
+    page_by_position = {
+        (page["document_id"], page["section"], page["page"]): page
+        for page in pages
+    }
+
+    unique_hits = []
+    hit_ids = set()
+    for hit in hits:
+        if hit["page_id"] not in hit_ids:
+            unique_hits.append({**hit, "source": "search_hit"})
+            hit_ids.add(hit["page_id"])
+
+    results = list(unique_hits)
+    included_ids = set(hit_ids)
+    for hit in unique_hits:
+        for page_number in (hit["page"] - 1, hit["page"] + 1):
+            page = page_by_position.get((hit["document_id"], hit["section"], page_number))
+            if page is not None and page["page_id"] not in included_ids:
+                results.append({**page, "source": "adjacent_page"})
+                included_ids.add(page["page_id"])
+    return results
+
+
+def search(query: str) -> list[dict]:
+    """質問に近いページと、同じ資料・章の前後1ページを返す。"""
+    hits = search_hits(query)
+    return _include_adjacent_pages(hits, load_pages(RAG_SOURCE))
 
 
 def search_graph(query: str) -> dict:
@@ -151,7 +182,7 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [hit for hit in search_hits(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
@@ -201,9 +232,14 @@ def run_full_context(agent, question: str, model, instructions: str, prompt_temp
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="エージェントを使わず、講義資料の検索だけを実行する")
     parser.add_argument("query", help="調べたい内容")
+    parser.add_argument("--hits-only", action="store_true", help="前後ページを含めず、検索ヒットだけを表示する")
     args = parser.parse_args()
-    for i, result in enumerate(search(args.query), 1):
+    results = search_hits(args.query) if args.hits_only else search(args.query)
+    for i, result in enumerate(results, 1):
         print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+        if not args.hits_only:
+            kind = "検索ヒット" if result["source"] == "search_hit" else "前後ページ"
+            print(f"取得区分: {kind}")
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
